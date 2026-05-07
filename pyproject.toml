@@ -9,6 +9,14 @@ dependencies = [
     "pycairo==1.29.0",
     "pygobject==3.56.2",
     "requests==2.33.1",
+    "ytpb==2026.1.18",
+]
+
+[dependency-groups]
+dev = [
+	"ruff==0.15.2",
+	"pytest==9.0.2",
+	"ty==0.0.18",
 ]
 
 [tool.uv]
