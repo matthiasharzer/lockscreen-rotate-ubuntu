@@ -2,6 +2,10 @@
 import argparse
 import logging
 import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
 import time
 import requests
 import dbus
@@ -12,24 +16,86 @@ from gi.repository import GLib
 # These define the behavior when the script decides to download a new video.
 DEFAULT_MAX_MOD_TIME_AFTER_UNLOCK = 60 * 30  # 30 minutes (in seconds)
 DEFAULT_MAX_MOD_TIME_ON_TICK = 60 * 60 * 2  # 2 hours (in seconds)
+DEFAULT_START_SECONDS_BEHIND = 600  # 10m
+DEFAULT_END_SECONDS_BEHIND = 0  # 0m
 CHECK_TICK_RATE_SECONDS = 60  # Periodic timer check every 60 seconds
 
 
-class VideoManager:
+def download_live_segment(
+    video_url: str,
+    start_seconds_behind: int,
+    end_seconds_behind: int,
+    final_output_path: str,
+) -> None:
+
+    # 1. Input validation
+    if start_seconds_behind <= end_seconds_behind:
+        raise ValueError(
+            "start_seconds_behind must be strictly greater than end_seconds_behind."
+        )
+    if end_seconds_behind < 0:
+        raise ValueError("end_seconds_behind cannot be negative.")
+
+    # 2. Format the interval string using ytpb's native 'now' math
+    start_str = f"now - PT{start_seconds_behind}S"
+    end_str = f"now - PT{end_seconds_behind}S" if end_seconds_behind > 0 else "now"
+
+    interval = f"{start_str}/{end_str}"
+    final_output = Path(final_output_path)
+
+    duration = start_seconds_behind - end_seconds_behind
+    logging.info(f"Preparing to download a {duration}-second segment...")
+    logging.info(f"Interval: {interval}")
+
+    # 3. Use TemporaryDirectory to guarantee cleanup on success or exception
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        tmp_file_output = Path(tmp_dir) / f"temp_segment{final_output.suffix}"
+        tmp_file = Path(f"{tmp_file_output}.mkv")
+
+        # Build the ytpb command
+        cmd = [
+            "ytpb",
+            "download",
+            video_url,
+            "--interval",
+            interval,
+            "--output",
+            str(tmp_file_output),
+        ]
+
+        # Execute the ytpb command
+        subprocess.run(cmd, check=True, capture_output=True, text=True, cwd=tmp_dir)
+
+        # Verify the file was actually created
+        if not tmp_file.exists():
+            raise FileNotFoundError(
+                "ytpb completed, but the output video file is missing."
+            )
+
+        # 4. Move the file from the temporary directory to the final destination
+        final_output.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(tmp_file), str(final_output))
+
+
+class YoutubeVideoManager:
     def __init__(
         self,
         url: str,
         symlink_path: str,
+        start_seconds_behind: int,
+        end_seconds_behind: int,
         max_mod_time_on_tick: int,
         max_mod_time_after_unlock: int,
         initial_unlock_state: bool,
     ) -> None:
         self.url = url
+        self.start_seconds_behind = start_seconds_behind
+        self.end_seconds_behind = end_seconds_behind
         self.symlink_path = os.path.abspath(symlink_path)
         self.max_mod_time_on_tick = max_mod_time_on_tick
         self.max_mod_time_after_unlock = max_mod_time_after_unlock
         # Use a persistent cache directory in the user's local share folder
-        self.storage_dir = os.path.expanduser("~/.local/share/video_updater_cache")
+        self.storage_dir = os.path.expanduser("~/.local/share/youtube_video_cache")
         os.makedirs(self.storage_dir, exist_ok=True)
 
         self.is_downloading = False
@@ -68,20 +134,14 @@ class VideoManager:
 
         timestamp = int(time.time())
         final_filename = os.path.join(self.storage_dir, f"video_{timestamp}.mp4")
-        temp_filename = final_filename + ".part"
 
         try:
-            # 1. Download to a temporary file
-            # Timeout ensures the script doesn't hang indefinitely on network drops
-            response = requests.get(self.url, stream=True, timeout=30)
-            response.raise_for_status()
-
-            with open(temp_filename, "wb") as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-
-            # 2. Rename temp file to final video file
-            os.rename(temp_filename, final_filename)
+            download_live_segment(
+                self.url,
+                self.start_seconds_behind,
+                self.end_seconds_behind,
+                final_filename,
+            )
             logging.info(f"Download complete: {final_filename}")
 
             # 3. Create/Update symlink atomically
@@ -100,9 +160,6 @@ class VideoManager:
 
         except (requests.RequestException, OSError) as e:
             logging.error(f"Download or file operation failed: {e}")
-            # Clean up the partial file if it exists
-            if os.path.exists(temp_filename):
-                os.remove(temp_filename)
             logging.info("Symlink remains unchanged, pointing to the last valid video.")
         finally:
             self.is_downloading = False
@@ -200,6 +257,18 @@ def main() -> None:
         help="The maximum modifcation time of the video file",
         type=int,
     )
+    parser.add_argument(
+        "--start-seconds-since-live",
+        required=False,
+        help="The seconds since live to start the clip from",
+        type=int,
+    )
+    parser.add_argument(
+        "--end-seconds-since-live",
+        required=False,
+        help="The seconds since live to end the clip at",
+        type=int,
+    )
     args = parser.parse_args()
 
     max_mod_time_after_unlock_seconds = args.max_mod_time_after_unlock_seconds
@@ -220,9 +289,11 @@ def main() -> None:
 
     initial_unlock_state = get_initial_unlock_state(session_bus)
 
-    manager = VideoManager(
+    manager = YoutubeVideoManager(
         args.url,
         args.symlink,
+        args.start_seconds_since_live or DEFAULT_START_SECONDS_BEHIND,
+        args.end_seconds_since_live or DEFAULT_END_SECONDS_BEHIND,
         max_mod_time_on_tick_seconds or DEFAULT_MAX_MOD_TIME_ON_TICK,
         max_mod_time_after_unlock_seconds or DEFAULT_MAX_MOD_TIME_AFTER_UNLOCK,
         initial_unlock_state,
